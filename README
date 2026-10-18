@@ -1,0 +1,133 @@
+# MCP exercise: weather + business-customer tools
+
+An MCP **server** exposing four tools, and an MCP **client** that runs a governed agent loop against it.
+
+| File | Role |
+|---|---|
+| `server.py` | MCP server (stdio). Tools: `geocode_city`, `get_weather`, `get_customer`, `get_business_account` |
+| `client.py` | MCP client + policy gate + Anthropic agent loop |
+| `smoke_test.py` | Protocol and policy tests. No API key, no model |
+
+## Do I need to start the server first?
+
+**No, not for this setup.** The server uses the **stdio** transport, so the client launches `server.py` itself as a subprocess and talks to it over stdin/stdout. When the client exits, the server exits with it.
+
+"Start the server first, then connect" only applies to HTTP-based transports (Streamable HTTP / SSE), where the server is a long-running process on a port. If you move to HTTP later, the order becomes: server, then client.
+
+This is also why `server.py` must never `print()` to stdout. Stdout is the protocol channel, so logs go to stderr.
+
+## Setup (once)
+
+```bash
+poetry --version                 # 1.8+ or 2.x both work
+poetry install                   # creates poetry.lock on first run
+cp .env.example .env        # then put your ANTHROPIC_API_KEY in .env
+```
+
+The key lives in the project-scoped `.env` (git-ignored), not a shell-wide variable.
+
+## Run order
+
+**1. Smoke test (always first, no API key needed)**
+
+```bash
+poetry run python smoke_test.py
+```
+
+Expect a banner line first (`smoke_test: python 3.x | mcp 2.x | <path>`), then PASS lines, `ALL PASSED` and `exit code 0`. It never exits silently: a crash prints its traceback. It launches the server in `WEATHER_MODE=mock` over real stdio MCP, then checks:
+- tool discovery and the tool manifest
+- policy rejections (fabricated coordinates, a personal customer asking for business details)
+- structured server errors
+- audit event shape
+
+If this fails, nothing downstream will work. Fix it here.
+
+**2. Inspect the server on its own (optional)**
+
+Quickest, no extra tools needed:
+
+```bash
+poetry run python list_tools.py
+```
+
+Launches the server over stdio, prints every tool with its JSON schema, and makes one call.
+
+Visual Inspector (optional, heavier):
+
+```bash
+WEATHER_MODE=mock poetry run mcp dev server.py
+```
+
+`mcp` is a **Python CLI installed into the venv by `mcp[cli]`**, not an OS package, so `sudo apt install mcp` will never work. `mcp dev` also needs two things outside Python on your PATH: **`uv`** and **Node.js (`npx`)**, because it runs `npx @modelcontextprotocol/inspector` against a `uv run` command. Check with `uv --version` and `node --version`. If either is missing, skip this step; `list_tools.py` covers the same ground.
+
+**3. Run the client (needs your key and network)**
+
+```bash
+poetry run python client.py "What's the weather in Melbourne right now?"
+```
+
+Things to try:
+
+| Prompt | What it exercises |
+|---|---|
+| `What's the weather in Melbourne?` | `geocode_city` then `get_weather` chain |
+| `Weather at latitude -37.8, longitude 144.9` | User-supplied coordinates against the policy |
+| `Compare the weather in Sydney and London` | Parallel tool calls, with all results in one message |
+| `Show business account details for C-1001` | `get_customer` then `get_business_account` |
+| `Show business account details for C-1002` | Policy rejection, then a graceful answer from the model |
+
+Iteration counts go to stderr as `[iter N] stop_reason=...`. A run ends with the audit event count and its correlation id.
+
+## Architecture in one screen
+
+```
+client.py                                   server.py
+┌──────────────────────────────┐            ┌─────────────────────────┐
+│ agent loop (stop_reason)     │            │ MCPServer (stdio)       │
+│   ├─ Policy.check()  ◄── governance       │   geocode_city          │
+│   ├─ session.call_tool() ───── MCP ─────► │   get_weather           │
+│   └─ Policy.observe() ◄── trusted state   │   get_customer          │
+│ audit events (correlation_id)│            │   get_business_account  │
+└──────────────────────────────┘            │ input validation +      │
+                                            │ structured errors       │
+                                            └─────────────────────────┘
+```
+
+- **Policy lives in the client**, because only the orchestrator sees conversation history. Rules are outcomes ("coordinates must be trusted"), not workflow steps ("geocoder must have run").
+- **The server still defends itself.** It validates input and refuses a personal customer's business lookup even if the policy were bypassed.
+- **Rejections are governance events.** They go back to the model as `tool_result` with `is_error: true`, never into retry or escalation.
+- **Tool errors are structured**: `errorCategory`, `isRetryable`, `message`, `attemptedInput`. `isRetryable` is the tool's claim; the orchestrator decides what to do with it.
+
+## Modes and config
+
+| Setting | Where | Effect |
+|---|---|---|
+| `WEATHER_MODE=mock` | env, passed to the server | Deterministic and offline. Used by `smoke_test.py` |
+| `WEATHER_MODE=live` (default) | env | Calls Open-Meteo (no API key needed) |
+| `MODEL`, `MAX_ITERATIONS` | top of `client.py` | Model choice and loop guard |
+
+## Version note (mcp 2.x)
+
+This project pins `mcp>=2.2,<3`. v2 renamed several things that most tutorials still show in v1 form:
+
+| v1 (most blog posts) | v2 (this repo) |
+|---|---|
+| `from mcp.server.fastmcp import FastMCP` | `from mcp.server import MCPServer` |
+| `CallToolResult(isError=...)` | `CallToolResult(is_error=...)` |
+| `tool.inputSchema` | `tool.input_schema` |
+
+The wire format is unchanged (`isError`, `inputSchema` in JSON). Only the Python attribute names changed. To run v1-style code instead, pin `mcp<2`.
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `MCPError: Connection closed` during `initialize` | The server subprocess crashed on startup. Run `python server.py` directly and read the traceback |
+| `ModuleNotFoundError: mcp.server.fastmcp` | v1 import with v2 installed. Use `MCPServer` |
+| `upstream_unavailable` on live weather | No route to Open-Meteo (proxy or firewall). It is a structured retryable error, not a bug |
+| Corrupted protocol or odd JSON-RPC errors | Something printed to stdout in the server. Use stderr |
+| `poetry install` does nothing, lock shows `package = []`, or `add` complains about Python `>=2.7` | Poetry 1.x (Ubuntu's apt version is 1.8.2) ignores a PEP 621 `[project]` table and saw no dependencies. This repo's `pyproject.toml` uses the classic `[tool.poetry]` layout that 1.8+ and 2.x both read. Delete the bad `poetry.lock`, then `poetry install` |
+| `ImportError: cannot import name 'MCPServer'` | `mcp` 1.x is installed in the venv. Run `pip list \| grep -i mcp`; `poetry install` should give 2.x |
+| `mcp: command not found` | Not inside the project venv. Use `poetry run mcp ...` |
+| `mcp dev` fails with `npx not found` or `uv: not found` | Install Node.js and uv, or use `list_tools.py` instead |
+| `smoke_test.py` prints nothing at all | Not the current file: no banner means it isn't running this version. Check `tail -n 3 smoke_test.py` shows `sys.exit(code)` and `wc -l` is about 101 |

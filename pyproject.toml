@@ -1,0 +1,19 @@
+# Classic [tool.poetry] layout: works on Poetry 1.8+ AND 2.x.
+# (Poetry 1.x silently ignores the PEP 621 [project] table, which is why this file doesn't use it.)
+[tool.poetry]
+name = "mcp-weather-customers"
+version = "0.1.0"
+description = "Exercise: MCP server + governed client (weather and business-customer tools)"
+authors = []
+package-mode = false           # scripts, not an installable package
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4.0"
+mcp = { version = ">=2.2,<3", extras = ["cli"] }   # v2 API: MCPServer (not FastMCP), is_error (not isError)
+httpx = ">=0.28,<1"            # server-side HTTP calls to Open-Meteo
+anthropic = ">=1.15,<2"        # client-side Messages API
+python-dotenv = ">=1.0,<2"     # loads ANTHROPIC_API_KEY from a project-scoped .env
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
